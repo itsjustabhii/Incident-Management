@@ -16,13 +16,17 @@ import * as notificationService from './notification.service.js';
 export async function listComments(incidentId, { skip, take }, user) {
   const where = {
     incidentId,
-    // VIEWERs cannot see internal notes — only participants and managers can
-    ...(user.role === USER_ROLE.VIEWER ? { isInternal: false } : {}),
+    // VIEWERs and SUPPORT_ENGINEERs cannot see internal notes — only ADMIN/MANAGER can
+    ...(
+      user.role === USER_ROLE.VIEWER || user.role === USER_ROLE.SUPPORT_ENGINEER
+        ? { isInternal: false }
+        : {}
+    ),
   };
 
   const [total, comments] = await Promise.all([
-    prisma.comment.count({ where }),
-    prisma.comment.findMany({
+    prisma.incidentComment.count({ where }),
+    prisma.incidentComment.findMany({
       where,
       include: { author: { select: { id: true, displayName: true, avatarUrl: true } } },
       orderBy: { createdAt: 'asc' },
@@ -43,16 +47,16 @@ export async function createComment(incidentId, data, user) {
   });
   if (!incident) throw new AppError('Incident not found', 404, 'NOT_FOUND');
 
-  // Only MANAGER/ADMIN can post internal notes
+  // Only MANAGER/ADMIN can post internal notes — SUPPORT_ENGINEER and VIEWER cannot
   const isInternal = data.isInternal && [USER_ROLE.ADMIN, USER_ROLE.MANAGER].includes(user.role);
 
   const comment = await prisma.$transaction(async (tx) => {
-    const created = await tx.comment.create({
+    const created = await tx.incidentComment.create({
       data: { incidentId, authorId: user.id, body: data.body, isInternal },
       include: { author: { select: { id: true, displayName: true, avatarUrl: true } } },
     });
 
-    await tx.auditLog.create({
+    await tx.incidentAuditLog.create({
       data: {
         incidentId,
         actorId: user.id,
@@ -77,14 +81,15 @@ export async function createComment(incidentId, data, user) {
  * Updates a comment. Only the original author or an admin can edit.
  */
 export async function updateComment(commentId, data, user) {
-  const comment = await prisma.comment.findUnique({ where: { id: commentId } });
+  const comment = await prisma.incidentComment.findUnique({ where: { id: commentId } });
   if (!comment) throw new AppError('Comment not found', 404, 'NOT_FOUND');
 
+  // Only the original author or an ADMIN can edit a comment
   if (comment.authorId !== user.id && user.role !== USER_ROLE.ADMIN) {
     throw new AppError('You can only edit your own comments', 403, 'FORBIDDEN');
   }
 
-  const updated = await prisma.comment.update({
+  const updated = await prisma.incidentComment.update({
     where: { id: commentId },
     data: { body: data.body, editedAt: new Date() },
     include: { author: { select: { id: true, displayName: true, avatarUrl: true } } },
@@ -98,16 +103,17 @@ export async function updateComment(commentId, data, user) {
  * Deletes a comment. Only the author or an admin can delete.
  */
 export async function deleteComment(commentId, user) {
-  const comment = await prisma.comment.findUnique({ where: { id: commentId } });
+  const comment = await prisma.incidentComment.findUnique({ where: { id: commentId } });
   if (!comment) throw new AppError('Comment not found', 404, 'NOT_FOUND');
 
+  // Only the original author or an ADMIN can delete a comment
   if (comment.authorId !== user.id && user.role !== USER_ROLE.ADMIN) {
     throw new AppError('You can only delete your own comments', 403, 'FORBIDDEN');
   }
 
   await prisma.$transaction(async (tx) => {
-    await tx.comment.delete({ where: { id: commentId } });
-    await tx.auditLog.create({
+    await tx.incidentComment.delete({ where: { id: commentId } });
+    await tx.incidentAuditLog.create({
       data: {
         incidentId: comment.incidentId,
         actorId: user.id,

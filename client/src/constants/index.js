@@ -32,7 +32,7 @@ export const INCIDENT_CATEGORY = Object.freeze({
 export const USER_ROLE = Object.freeze({
   ADMIN: 'ADMIN',
   MANAGER: 'MANAGER',
-  ENGINEER: 'ENGINEER',
+  SUPPORT_ENGINEER: 'SUPPORT_ENGINEER',
   VIEWER: 'VIEWER',
 });
 

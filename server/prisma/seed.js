@@ -5,8 +5,8 @@
  *
  * Creates:
  *   • 1 organization (IncidentHub Corp)
- *   • Role reference records (ADMIN, MANAGER, ENGINEER, VIEWER)
- *   • 7 users: 1 admin, 2 managers, 3 engineers, 1 viewer
+ *   • Role reference records (ADMIN, MANAGER, SUPPORT_ENGINEER, VIEWER)
+ *   • 7 users: 1 admin, 2 managers, 3 support engineers, 1 viewer
  *   • 2 teams with members
  *   • 4 SLA policies (one per priority)
  *   • 10 incidents spanning all statuses, priorities, and categories
@@ -82,10 +82,10 @@ async function main() {
           'Manages team incidents, views all dashboards, assigns and escalates incidents.',
       },
       {
-        name: 'ENGINEER',
+        name: 'SUPPORT_ENGINEER',
         label: 'Support Engineer',
         description:
-          'Creates and updates incidents, adds comments, resolves assigned incidents.',
+          'Creates and updates assigned incidents, adds comments, uploads attachments, resolves incidents.',
       },
       {
         name: 'VIEWER',
@@ -170,19 +170,19 @@ async function main() {
       email: 'alex.engineer@incidenthub.dev',
       plainPassword: 'Engineer1234!',
       displayName: 'Alex Rivera',
-      role: 'ENGINEER',
+      role: 'SUPPORT_ENGINEER',
     }),
     upsertUser({
       email: 'priya.engineer@incidenthub.dev',
       plainPassword: 'Engineer1234!',
       displayName: 'Priya Sharma',
-      role: 'ENGINEER',
+      role: 'SUPPORT_ENGINEER',
     }),
     upsertUser({
       email: 'tom.engineer@incidenthub.dev',
       plainPassword: 'Engineer1234!',
       displayName: 'Tom Walsh',
-      role: 'ENGINEER',
+      role: 'SUPPORT_ENGINEER',
     }),
     upsertUser({
       email: 'viewer@incidenthub.dev',
@@ -1085,7 +1085,7 @@ async function main() {
         incidentId: null, actorId: admin.id,
         action: 'USER_ROLE_CHANGED',
         fieldName: 'role',
-        oldValue: 'ENGINEER',
+        oldValue: 'SUPPORT_ENGINEER',
         newValue: 'VIEWER',
         metadata: { targetUserId: viewer.id, targetEmail: viewer.email },
         createdAt: offsetDate(now, -14 * DAY),
@@ -1271,9 +1271,9 @@ async function main() {
   console.log('  │ admin@incidenthub.dev                │ Admin1234!        │ ADMIN    │');
   console.log('  │ sarah.manager@incidenthub.dev        │ Manager1234!      │ MANAGER  │');
   console.log('  │ james.manager@incidenthub.dev        │ Manager1234!      │ MANAGER  │');
-  console.log('  │ alex.engineer@incidenthub.dev        │ Engineer1234!     │ ENGINEER │');
-  console.log('  │ priya.engineer@incidenthub.dev       │ Engineer1234!     │ ENGINEER │');
-  console.log('  │ tom.engineer@incidenthub.dev         │ Engineer1234!     │ ENGINEER │');
+  console.log('  │ alex.engineer@incidenthub.dev        │ Engineer1234!     │ SUPPORT_ENGINEER │');
+  console.log('  │ priya.engineer@incidenthub.dev       │ Engineer1234!     │ SUPPORT_ENGINEER │');
+  console.log('  │ tom.engineer@incidenthub.dev         │ Engineer1234!     │ SUPPORT_ENGINEER │');
   console.log('  │ viewer@incidenthub.dev               │ Viewer1234!       │ VIEWER   │');
   console.log('  └──────────────────────────────────────┴───────────────────┴──────────┘');
 }

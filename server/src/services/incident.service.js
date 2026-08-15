@@ -41,7 +41,7 @@ const INCIDENT_LIST_SELECT = {
 
 /**
  * Builds a Prisma where clause from the validated query parameters.
- * Applies role-based filtering: ENGINEERs can only see incidents they are
+ * Applies role-based filtering: SUPPORT_ENGINEERs can only see incidents they are
  * involved with; VIEWERs cannot see internal data.
  *
  * @param {object} query - Validated query params
@@ -67,8 +67,9 @@ function buildIncidentFilter(query, user) {
     ];
   }
 
-  // ENGINEERs can only see incidents they reported or are assigned to
-  if (user.role === USER_ROLE.ENGINEER) {
+  // SUPPORT_ENGINEERs and VIEWERs can only see incidents they reported or are assigned to.
+  // ADMIN and MANAGER see all incidents for their organization.
+  if (user.role === USER_ROLE.SUPPORT_ENGINEER || user.role === USER_ROLE.VIEWER) {
     where.OR = [
       ...(where.OR || []),
       { reportedById: user.id },
@@ -136,7 +137,7 @@ export async function createIncident(data, user) {
     });
 
     // Record audit log inside the same transaction so it's atomic with the create
-    await tx.auditLog.create({
+    await tx.incidentAuditLog.create({
       data: {
         incidentId: created.id,
         actorId: user.id,
@@ -188,9 +189,10 @@ export async function getIncidentById(id, user) {
     throw new AppError('Incident not found', 404, 'NOT_FOUND');
   }
 
-  // Engineers can only view incidents they are involved with
+  // SUPPORT_ENGINEERs and VIEWERs can only view incidents they are involved with.
+  // ADMIN and MANAGER can view all incidents.
   if (
-    user.role === USER_ROLE.ENGINEER &&
+    (user.role === USER_ROLE.SUPPORT_ENGINEER || user.role === USER_ROLE.VIEWER) &&
     incident.reportedById !== user.id &&
     incident.assigneeId !== user.id
   ) {
@@ -212,13 +214,32 @@ export async function updateIncident(id, changes, user) {
   const existing = await prisma.incident.findUnique({ where: { id } });
   if (!existing) throw new AppError('Incident not found', 404, 'NOT_FOUND');
 
-  // Engineers can only modify incidents they are involved with
+  // SUPPORT_ENGINEERs can only modify incidents they are involved with.
+  // ADMIN and MANAGER can modify any incident.
   if (
-    user.role === USER_ROLE.ENGINEER &&
+    user.role === USER_ROLE.SUPPORT_ENGINEER &&
     existing.reportedById !== user.id &&
     existing.assigneeId !== user.id
   ) {
     throw new AppError('You do not have permission to modify this incident', 403, 'FORBIDDEN');
+  }
+
+  // SUPPORT_ENGINEERs cannot change assignee or priority — management-only fields
+  if (user.role === USER_ROLE.SUPPORT_ENGINEER) {
+    if (changes.assigneeId !== undefined) {
+      throw new AppError(
+        'Support engineers cannot reassign incidents — contact a manager',
+        403,
+        'FORBIDDEN',
+      );
+    }
+    if (changes.priority !== undefined && changes.priority !== existing.priority) {
+      throw new AppError(
+        'Support engineers cannot change incident priority — contact a manager',
+        403,
+        'FORBIDDEN',
+      );
+    }
   }
 
   // Enforce the status state machine — reject invalid transitions
@@ -286,7 +307,7 @@ export async function updateIncident(id, changes, user) {
       }));
 
     if (auditEntries.length > 0) {
-      await tx.auditLog.createMany({ data: auditEntries });
+      await tx.incidentAuditLog.createMany({ data: auditEntries });
     }
 
     return result;
@@ -315,7 +336,7 @@ export async function deleteIncident(id, user) {
   if (!existing) throw new AppError('Incident not found', 404, 'NOT_FOUND');
 
   await prisma.$transaction(async (tx) => {
-    await tx.auditLog.create({
+    await tx.incidentAuditLog.create({
       data: {
         incidentId: id,
         actorId: user.id,
@@ -338,8 +359,8 @@ export async function deleteIncident(id, user) {
  */
 export async function getAuditLog(incidentId, { skip, take }) {
   const [total, logs] = await Promise.all([
-    prisma.auditLog.count({ where: { incidentId } }),
-    prisma.auditLog.findMany({
+    prisma.incidentAuditLog.count({ where: { incidentId } }),
+    prisma.incidentAuditLog.findMany({
       where: { incidentId },
       include: { actor: { select: { id: true, displayName: true, avatarUrl: true } } },
       orderBy: { createdAt: 'desc' },

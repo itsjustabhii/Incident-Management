@@ -26,11 +26,28 @@ import { toggleSidebar } from '../../store/uiSlice.js';
 import { selectCurrentUser } from '../../features/auth/authSlice.js';
 import { USER_ROLE } from '../../constants/index.js';
 
+/**
+ * Navigation item definitions with optional role-based visibility.
+ * `roles` — if set, the item is only visible to users whose role is in the list.
+ * Items without `roles` are visible to all authenticated users.
+ *
+ * UX-only: the server independently enforces access on all API calls.
+ * Hiding nav items prevents confusion, not privilege escalation.
+ */
 const NAV_ITEMS = [
+  // Dashboard — all roles can see basic stats
   { label: 'Dashboard', icon: <DashboardIcon />, path: '/dashboard' },
+  // Incidents — all roles (scoped by server: SUPPORT_ENGINEER sees own only)
   { label: 'Incidents', icon: <BugReportIcon />, path: '/incidents' },
-  { label: 'Users', icon: <PeopleIcon />, path: '/users', roles: [USER_ROLE.ADMIN, USER_ROLE.MANAGER] },
-  { label: 'Teams', icon: <GroupsIcon />, path: '/teams', roles: [USER_ROLE.ADMIN, USER_ROLE.MANAGER] },
+  // Users management — ADMIN and MANAGER only
+  {
+    label: 'Users',
+    icon: <PeopleIcon />,
+    path: '/users',
+    roles: [USER_ROLE.ADMIN, USER_ROLE.MANAGER],
+  },
+  // Teams — all roles can view team membership
+  { label: 'Teams', icon: <GroupsIcon />, path: '/teams' },
 ];
 
 /**
@@ -45,7 +62,13 @@ function Sidebar({ width, collapsedWidth }) {
   const currentUser = useSelector(selectCurrentUser);
   const currentWidth = sidebarOpen ? width : collapsedWidth;
 
-  /** Filters nav items based on the current user's role */
+  /**
+   * Filters nav items based on the current user's role.
+   * Items with no `roles` array are visible to all authenticated users.
+   * Items with `roles` are only shown to users whose role is in the list.
+   *
+   * This is purely a UX filter — the backend authorizes every API call independently.
+   */
   const visibleItems = NAV_ITEMS.filter(
     (item) => !item.roles || item.roles.includes(currentUser?.role),
   );

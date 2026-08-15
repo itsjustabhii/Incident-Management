@@ -9,7 +9,7 @@ import { AUDIT_ACTION } from '../constants/audit.js';
 import { USER_ROLE } from '../constants/roles.js';
 
 export async function listAttachments(incidentId) {
-  return prisma.attachment.findMany({
+  return prisma.incidentAttachment.findMany({
     where: { incidentId },
     include: { uploadedBy: { select: { id: true, displayName: true } } },
     orderBy: { createdAt: 'desc' },
@@ -27,7 +27,7 @@ export async function createAttachments(incidentId, files, user) {
   return prisma.$transaction(async (tx) => {
     const attachments = await Promise.all(
       files.map((file) =>
-        tx.attachment.create({
+        tx.incidentAttachment.create({
           data: {
             incidentId,
             uploadedById: user.id,
@@ -40,7 +40,7 @@ export async function createAttachments(incidentId, files, user) {
       ),
     );
 
-    await tx.auditLog.create({
+    await tx.incidentAuditLog.create({
       data: {
         incidentId,
         actorId: user.id,
@@ -54,15 +54,15 @@ export async function createAttachments(incidentId, files, user) {
 }
 
 export async function getAttachment(attachmentId, user) {
-  const attachment = await prisma.attachment.findUnique({
+  const attachment = await prisma.incidentAttachment.findUnique({
     where: { id: attachmentId },
     include: { incident: { select: { reportedById: true, assigneeId: true } } },
   });
   if (!attachment) throw new AppError('Attachment not found', 404, 'NOT_FOUND');
 
-  // VIEWERs can download attachments but cannot access restricted incidents
+  // SUPPORT_ENGINEERs and VIEWERs can only access attachments on incidents they are involved with
   if (
-    user.role === USER_ROLE.ENGINEER &&
+    (user.role === USER_ROLE.SUPPORT_ENGINEER || user.role === USER_ROLE.VIEWER) &&
     attachment.incident.reportedById !== user.id &&
     attachment.incident.assigneeId !== user.id
   ) {
@@ -73,16 +73,17 @@ export async function getAttachment(attachmentId, user) {
 }
 
 export async function deleteAttachment(attachmentId, user) {
-  const attachment = await prisma.attachment.findUnique({ where: { id: attachmentId } });
+  const attachment = await prisma.incidentAttachment.findUnique({ where: { id: attachmentId } });
   if (!attachment) throw new AppError('Attachment not found', 404, 'NOT_FOUND');
 
+  // Only the uploader or an ADMIN can delete an attachment
   if (attachment.uploadedById !== user.id && user.role !== USER_ROLE.ADMIN) {
     throw new AppError('You can only delete your own attachments', 403, 'FORBIDDEN');
   }
 
   await prisma.$transaction(async (tx) => {
-    await tx.attachment.delete({ where: { id: attachmentId } });
-    await tx.auditLog.create({
+    await tx.incidentAttachment.delete({ where: { id: attachmentId } });
+    await tx.incidentAuditLog.create({
       data: {
         incidentId: attachment.incidentId,
         actorId: user.id,

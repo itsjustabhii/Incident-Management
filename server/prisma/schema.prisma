@@ -34,7 +34,7 @@ datasource db {
 enum UserRole {
   ADMIN
   MANAGER
-  ENGINEER
+  SUPPORT_ENGINEER
   VIEWER
 }
 
@@ -151,7 +151,7 @@ model User {
   passwordHash String    @map("password_hash")
   displayName  String    @map("display_name")
   avatarUrl    String?   @map("avatar_url")
-  role         UserRole  @default(ENGINEER)
+  role         UserRole  @default(SUPPORT_ENGINEER)
   active       Boolean   @default(true) // Soft-delete / account disable flag
   lastLoginAt  DateTime? @map("last_login_at")
   createdAt    DateTime  @default(now()) @map("created_at")

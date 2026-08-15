@@ -53,9 +53,11 @@ export async function getStats(user) {
   const cacheKey = `cache:dashboard:stats:${user.id}`;
 
   return cacheAside(cacheKey, async () => {
-    const where = user.role === 'ENGINEER'
-      ? { OR: [{ reportedById: user.id }, { assigneeId: user.id }] }
-      : {};
+    // SUPPORT_ENGINEERs and VIEWERs see only their own incidents; ADMIN/MANAGER see all
+    const where =
+      user.role === 'SUPPORT_ENGINEER' || user.role === 'VIEWER'
+        ? { OR: [{ reportedById: user.id }, { assigneeId: user.id }] }
+        : {};
 
     const [byStatus, byPriority, totalOpen, slaBreached] = await Promise.all([
       prisma.incident.groupBy({
