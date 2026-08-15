@@ -1,0 +1,251 @@
+// ==============================================================================
+// Prisma Schema — Enterprise Incident & Support Management Platform
+//
+// Design principles:
+//   - UUIDs as primary keys (portable, avoids enumerable sequential IDs)
+//   - All timestamps in UTC (stored as DateTime)
+//   - Soft deletes via 'active' flag on User (never hard-delete users)
+//   - Explicit indexes on all foreign keys and high-frequency filter columns
+//   - Audit logs are insert-only (no update/delete operations on that model)
+// ==============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ── Enumerations ──────────────────────────────────────────────────────────────
+
+enum UserRole {
+  ADMIN
+  MANAGER
+  ENGINEER
+  VIEWER
+}
+
+enum IncidentStatus {
+  OPEN
+  IN_PROGRESS
+  ON_HOLD
+  RESOLVED
+  CLOSED
+}
+
+enum IncidentPriority {
+  CRITICAL
+  HIGH
+  MEDIUM
+  LOW
+}
+
+enum IncidentCategory {
+  INFRASTRUCTURE
+  APPLICATION
+  SECURITY
+  NETWORK
+  DATABASE
+  PERFORMANCE
+  OTHER
+}
+
+enum NotificationType {
+  INCIDENT_ASSIGNED
+  INCIDENT_UPDATED
+  INCIDENT_RESOLVED
+  COMMENT_ADDED
+  SLA_AT_RISK
+  SLA_BREACHED
+  INCIDENT_ESCALATED
+}
+
+// ── Models ────────────────────────────────────────────────────────────────────
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  displayName  String   @map("display_name")
+  avatarUrl    String?  @map("avatar_url")
+  role         UserRole @default(ENGINEER)
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  reportedIncidents  Incident[]    @relation("ReportedBy")
+  assignedIncidents  Incident[]    @relation("AssignedTo")
+  teamMemberships    TeamMember[]
+  comments           Comment[]
+  attachments        Attachment[]
+  auditLogs          AuditLog[]
+  notifications      Notification[]
+  refreshTokens      RefreshToken[]
+
+  @@index([email])
+  @@index([role])
+  @@index([active])
+  @@map("users")
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+  jti       String   @unique // JWT ID — stored to support token invalidation
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+  revoked   Boolean  @default(false)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([jti])
+  @@map("refresh_tokens")
+}
+
+model Team {
+  id          String   @id @default(uuid())
+  name        String   @unique
+  description String?
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  members   TeamMember[]
+  incidents Incident[]
+
+  @@map("teams")
+}
+
+model TeamMember {
+  userId    String   @map("user_id")
+  teamId    String   @map("team_id")
+  role      String   @default("MEMBER") // 'MEMBER' | 'LEAD'
+  joinedAt  DateTime @default(now()) @map("joined_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@id([userId, teamId])
+  @@index([teamId])
+  @@map("team_members")
+}
+
+model Incident {
+  id          String           @id @default(uuid())
+  title       String
+  description String           @db.Text
+  status      IncidentStatus   @default(OPEN)
+  priority    IncidentPriority @default(MEDIUM)
+  category    IncidentCategory @default(OTHER)
+
+  // Parties
+  reportedById String  @map("reported_by_id")
+  assigneeId   String? @map("assignee_id")
+  teamId       String? @map("team_id")
+
+  // SLA tracking
+  slaBreachAt      DateTime? @map("sla_breach_at")
+  slaBreached      Boolean   @default(false) @map("sla_breached")
+  slaHoldStartedAt DateTime? @map("sla_hold_started_at") // Set when status → ON_HOLD
+
+  // Lifecycle timestamps
+  resolvedAt DateTime? @map("resolved_at")
+  closedAt   DateTime? @map("closed_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  reportedBy  User         @relation("ReportedBy", fields: [reportedById], references: [id])
+  assignee    User?        @relation("AssignedTo", fields: [assigneeId], references: [id])
+  team        Team?        @relation(fields: [teamId], references: [id])
+  comments    Comment[]
+  attachments Attachment[]
+  auditLogs   AuditLog[]
+
+  // Indexes based on the most common query patterns
+  @@index([status])
+  @@index([priority])
+  @@index([status, priority]) // Dashboard filter queries
+  @@index([assigneeId])       // Workload queries per engineer
+  @@index([teamId])           // Team dashboard queries
+  @@index([reportedById])
+  @@index([slaBreachAt])      // SLA monitor job query
+  @@index([createdAt])        // Time-series / trend queries
+  @@map("incidents")
+}
+
+model Comment {
+  id         String   @id @default(uuid())
+  incidentId String   @map("incident_id")
+  authorId   String   @map("author_id")
+  body       String   @db.Text
+  isInternal Boolean  @default(false) @map("is_internal") // Internal notes not visible to VIEWER role
+  editedAt   DateTime? @map("edited_at")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  incident Incident @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+  author   User     @relation(fields: [authorId], references: [id])
+
+  @@index([incidentId])
+  @@index([authorId])
+  @@map("comments")
+}
+
+model Attachment {
+  id           String   @id @default(uuid())
+  incidentId   String   @map("incident_id")
+  uploadedById String   @map("uploaded_by_id")
+  filename     String   // Original filename shown in the UI
+  storagePath  String   @map("storage_path") // Path on disk or S3 key
+  mimeType     String   @map("mime_type")
+  size         Int      // File size in bytes
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  incident   Incident @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+  uploadedBy User     @relation(fields: [uploadedById], references: [id])
+
+  @@index([incidentId])
+  @@map("attachments")
+}
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  incidentId String?  @map("incident_id") // Nullable — some audit entries are system-wide
+  actorId    String   @map("actor_id")
+  action     String   // One of the AUDIT_ACTION constants
+  fieldName  String?  @map("field_name") // The specific field that changed
+  oldValue   String?  @map("old_value")  // Stored as JSON string for complex values
+  newValue   String?  @map("new_value")
+  metadata   Json?    // Additional context (e.g., IP address, user agent)
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  // Insert-only — no update or delete operations permitted
+  incident Incident? @relation(fields: [incidentId], references: [id], onDelete: SetNull)
+  actor    User      @relation(fields: [actorId], references: [id])
+
+  @@index([incidentId]) // Audit history per incident
+  @@index([actorId])    // Audit history per user (admin view)
+  @@index([action])     // Filter by action type
+  @@index([createdAt])  // Time-range queries
+  @@map("audit_logs")
+}
+
+model Notification {
+  id          String           @id @default(uuid())
+  userId      String           @map("user_id")
+  type        NotificationType
+  title       String
+  body        String
+  referenceId String?          @map("reference_id") // e.g., incidentId for deep-linking
+  read        Boolean          @default(false)
+  createdAt   DateTime         @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, read]) // Badge count query — frequent and must be fast
+  @@index([userId, createdAt])
+  @@map("notifications")
+}

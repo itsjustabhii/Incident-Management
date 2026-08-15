@@ -1,0 +1,38 @@
+# Root ESLint configuration (workspace-level baseline)
+# Each workspace overrides this with its own .eslintrc.cjs
+
+root: true
+
+env:
+  es2022: true
+  node: true
+
+parserOptions:
+  ecmaVersion: 2022
+  sourceType: module
+
+plugins:
+  - prettier
+
+rules:
+  # Enforce Prettier formatting as an ESLint error so CI catches formatting issues
+  prettier/prettier: error
+
+  # Catch accidental variable-name bugs
+  no-unused-vars:
+    - warn
+    - argsIgnorePattern: "^_"
+      varsIgnorePattern: "^_"
+
+  # Prevent accidental use of console in production code (use the logger utility instead)
+  no-console:
+    - warn
+    - allow:
+        - warn
+        - error
+
+  # Disallow var — use const/let everywhere
+  no-var: error
+
+  # Prefer const for variables that are never reassigned
+  prefer-const: error

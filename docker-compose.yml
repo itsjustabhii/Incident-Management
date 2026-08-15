@@ -1,0 +1,130 @@
+version: '3.9'
+
+# ==============================================================================
+# Enterprise Incident & Support Management Platform — Docker Compose
+#
+# Services:
+#   postgres  — PostgreSQL 16 (primary datastore)
+#   redis     — Redis 7 (cache, session store, pub/sub)
+#   server    — Express.js API + Socket.IO
+#   client    — React SPA served by nginx
+#
+# Usage:
+#   docker-compose up -d            # start all services detached
+#   docker-compose logs -f server   # tail server logs
+#   docker-compose down -v          # stop and remove volumes
+# ==============================================================================
+
+services:
+  # ── PostgreSQL ───────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: incident_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-incident_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dev_password_change_in_prod}
+      POSTGRES_DB: ${POSTGRES_DB:-incident_management}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Init script runs only on first container start
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-incident_user} -d ${POSTGRES_DB:-incident_management}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - incident_net
+
+  # ── Redis ─────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: incident_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+      --requirepass ${REDIS_PASSWORD:-}
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - incident_net
+
+  # ── API Server ────────────────────────────────────────────────────────────────
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+      target: development
+    container_name: incident_server
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Override DB host to use the Docker service name instead of localhost
+      DATABASE_URL: postgresql://${POSTGRES_USER:-incident_user}:${POSTGRES_PASSWORD:-dev_password_change_in_prod}@postgres:5432/${POSTGRES_DB:-incident_management}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    ports:
+      - "${SERVER_PORT:-5000}:5000"
+    volumes:
+      # Mount source for hot-reload in development
+      - ./server:/app
+      - /app/node_modules
+      - uploads_data:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - incident_net
+
+  # ── React Client ──────────────────────────────────────────────────────────────
+  client:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+      target: development
+    container_name: incident_client
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      VITE_API_BASE_URL: http://localhost:5000/api/v1
+      VITE_WS_URL: http://localhost:5000
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./client:/app
+      - /app/node_modules
+    depends_on:
+      - server
+    networks:
+      - incident_net
+
+# ── Named Volumes ─────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  uploads_data:
+    driver: local
+
+# ── Networks ──────────────────────────────────────────────────────────────────
+networks:
+  incident_net:
+    driver: bridge
