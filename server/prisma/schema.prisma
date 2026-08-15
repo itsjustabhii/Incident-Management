@@ -2,11 +2,22 @@
 // Prisma Schema — Enterprise Incident & Support Management Platform
 //
 // Design principles:
-//   - UUIDs as primary keys (portable, avoids enumerable sequential IDs)
-//   - All timestamps in UTC (stored as DateTime)
-//   - Soft deletes via 'active' flag on User (never hard-delete users)
-//   - Explicit indexes on all foreign keys and high-frequency filter columns
-//   - Audit logs are insert-only (no update/delete operations on that model)
+//   • UUIDs as primary keys — non-sequential, safe to expose in URLs/APIs.
+//     Sequential integers allow enumeration attacks and leak record counts.
+//   • incidentNumber — a human-readable auto-increment sequence surfaced via
+//     a PostgreSQL SEQUENCE wrapped in a default expression.  UUIDs are the PK;
+//     incidentNumber is only for human reference (INC-0001 style display).
+//   • All timestamps stored as DateTime (UTC in PostgreSQL).
+//   • Soft-delete on User (active flag) — audit logs reference actorId and
+//     hard-deleting a user would orphan those records.
+//   • Soft-delete on Incident (deletedAt) — incidents must be recoverable and
+//     their full audit trail must survive a "delete" action.
+//   • Audit logs are insert-only.  The repository layer must never call
+//     prisma.auditLog.update() or prisma.auditLog.delete().
+//   • Cascading deletes are intentional: comments/attachments for a hard-
+//     deleted incident are orphaned data with no value; notifications follow
+//     their owner user.
+//   • Indexes are chosen by real access patterns documented per index below.
 // ==============================================================================
 
 generator client {
@@ -62,190 +73,530 @@ enum NotificationType {
   INCIDENT_ESCALATED
 }
 
+enum AuditAction {
+  INCIDENT_CREATED
+  INCIDENT_UPDATED
+  INCIDENT_DELETED
+  INCIDENT_RESTORED
+  STATUS_CHANGED
+  PRIORITY_CHANGED
+  ASSIGNED
+  UNASSIGNED
+  REASSIGNED
+  COMMENT_ADDED
+  COMMENT_EDITED
+  COMMENT_DELETED
+  ATTACHMENT_ADDED
+  ATTACHMENT_DELETED
+  SLA_BREACHED
+  SLA_PAUSED
+  SLA_RESUMED
+  USER_ROLE_CHANGED
+  USER_DEACTIVATED
+  USER_ACTIVATED
+}
+
 // ── Models ────────────────────────────────────────────────────────────────────
 
+// ------------------------------------------------------------------------------
+// Organization
+// Multi-tenant anchor: every incident, team, and SLA policy belongs to one org.
+// Users are linked to an org via OrganizationMember.
+// ------------------------------------------------------------------------------
+model Organization {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  slug      String   @unique // URL-safe identifier, e.g. "acme-corp"
+  logoUrl   String?  @map("logo_url")
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  members    OrganizationMember[]
+  teams      Team[]
+  incidents  Incident[]
+  slaPolices SLAPolicy[]
+
+  // Slug is queried on every request when resolving tenant context.
+  @@index([slug])
+  @@index([active])
+  @@map("organizations")
+}
+
+// Join table: user ↔ organization (a user can belong to multiple orgs in SaaS)
+model OrganizationMember {
+  userId         String   @map("user_id")
+  organizationId String   @map("organization_id")
+  joinedAt       DateTime @default(now()) @map("joined_at")
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@id([userId, organizationId])
+  // Lookup "which orgs does this user belong to?" — used in auth middleware
+  @@index([userId])
+  // Lookup "who belongs to this org?" — used in admin user-management page
+  @@index([organizationId])
+  @@map("organization_members")
+}
+
+// ------------------------------------------------------------------------------
+// User
+// Soft-deleted via active flag — never hard-delete; audit log rows reference
+// actorId and foreign key is set to SetNull on hard delete (as safety net).
+// ------------------------------------------------------------------------------
 model User {
-  id           String   @id @default(uuid())
-  email        String   @unique
-  passwordHash String   @map("password_hash")
-  displayName  String   @map("display_name")
-  avatarUrl    String?  @map("avatar_url")
-  role         UserRole @default(ENGINEER)
-  active       Boolean  @default(true)
-  createdAt    DateTime @default(now()) @map("created_at")
-  updatedAt    DateTime @updatedAt @map("updated_at")
+  id           String    @id @default(uuid())
+  email        String    @unique
+  passwordHash String    @map("password_hash")
+  displayName  String    @map("display_name")
+  avatarUrl    String?   @map("avatar_url")
+  role         UserRole  @default(ENGINEER)
+  active       Boolean   @default(true) // Soft-delete / account disable flag
+  lastLoginAt  DateTime? @map("last_login_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
 
   // Relations
-  reportedIncidents  Incident[]    @relation("ReportedBy")
-  assignedIncidents  Incident[]    @relation("AssignedTo")
-  teamMemberships    TeamMember[]
-  comments           Comment[]
-  attachments        Attachment[]
-  auditLogs          AuditLog[]
-  notifications      Notification[]
-  refreshTokens      RefreshToken[]
+  organizations       OrganizationMember[]
+  reportedIncidents   Incident[]               @relation("ReportedBy")
+  assignedIncidents   Incident[]               @relation("AssignedTo")
+  incidentAssignments IncidentAssignment[]
+  teamMemberships     TeamMember[]
+  comments            IncidentComment[]
+  attachments         IncidentAttachment[]
+  auditLogs           IncidentAuditLog[]
+  notifications       Notification[]
+  notificationPrefs   NotificationPreference[]
+  refreshTokens       RefreshToken[]
+  sessions            Session[]
 
-  @@index([email])
+  // email is already @unique so its B-tree is used for exact lookups.
+  // role index: admin panel lists users by role, RBAC checks filter on role.
   @@index([role])
+  // active index: every auth middleware check filters active = true.
   @@index([active])
   @@map("users")
 }
 
+// ------------------------------------------------------------------------------
+// Role — stored as an enum directly on User for simplicity.
+// This model exists as a reference table for UI display (label, description,
+// permissions summary) and future fine-grained permission expansion.
+// ------------------------------------------------------------------------------
+model Role {
+  id          String   @id @default(uuid())
+  name        UserRole @unique
+  label       String // Human-readable: "Support Engineer"
+  description String
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@map("roles")
+}
+
+// ------------------------------------------------------------------------------
+// RefreshToken
+// Stored in DB for rotation + revocation (not just Redis) so that token
+// invalidation survives Redis flushes.  jti (JWT ID) is the lookup key.
+// ------------------------------------------------------------------------------
 model RefreshToken {
   id        String   @id @default(uuid())
   userId    String   @map("user_id")
-  jti       String   @unique // JWT ID — stored to support token invalidation
+  // jti matches the `jti` claim in the JWT — used to detect replay / revocation
+  jti       String   @unique
   expiresAt DateTime @map("expires_at")
   createdAt DateTime @default(now()) @map("created_at")
   revoked   Boolean  @default(false)
+  // Store where the token was issued from for security auditing
+  userAgent String?  @map("user_agent")
+  ipAddress String?  @map("ip_address")
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  // userId: revoke all tokens for a user on password change / forced logout
   @@index([userId])
+  // jti: O(log n) lookup on token verification — called on every refresh
   @@index([jti])
   @@map("refresh_tokens")
 }
 
+// ------------------------------------------------------------------------------
+// Session
+// Lightweight server-side session record complementing the JWT.
+// Allows forced logout from admin panel and "active sessions" security page.
+// ------------------------------------------------------------------------------
+model Session {
+  id         String   @id @default(uuid())
+  userId     String   @map("user_id")
+  // Links to the refresh token that created this session
+  jti        String   @unique
+  expiresAt  DateTime @map("expires_at")
+  createdAt  DateTime @default(now()) @map("created_at")
+  lastSeenAt DateTime @default(now()) @map("last_seen_at")
+  userAgent  String?  @map("user_agent")
+  ipAddress  String?  @map("ip_address")
+  active     Boolean  @default(true)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // All active sessions for a user (security page, forced-logout)
+  @@index([userId, active])
+  @@map("sessions")
+}
+
+// ------------------------------------------------------------------------------
+// Team
+// Groups of users within an organization.
+// ------------------------------------------------------------------------------
 model Team {
-  id          String   @id @default(uuid())
-  name        String   @unique
-  description String?
-  createdAt   DateTime @default(now()) @map("created_at")
-  updatedAt   DateTime @updatedAt @map("updated_at")
+  id             String   @id @default(uuid())
+  organizationId String   @map("organization_id")
+  name           String
+  description    String?
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
 
-  members   TeamMember[]
-  incidents Incident[]
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  members      TeamMember[]
+  incidents    Incident[]
 
+  // Team names must be unique per org, not globally
+  @@unique([organizationId, name])
+  // Org-scoped team listing — used in team management page
+  @@index([organizationId])
   @@map("teams")
 }
 
 model TeamMember {
-  userId    String   @map("user_id")
-  teamId    String   @map("team_id")
-  role      String   @default("MEMBER") // 'MEMBER' | 'LEAD'
-  joinedAt  DateTime @default(now()) @map("joined_at")
+  userId   String   @map("user_id")
+  teamId   String   @map("team_id")
+  role     String   @default("MEMBER") // 'MEMBER' | 'LEAD'
+  joinedAt DateTime @default(now()) @map("joined_at")
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
   team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
 
   @@id([userId, teamId])
+  // All members of a team — rendered on the team detail page
   @@index([teamId])
   @@map("team_members")
 }
 
-model Incident {
-  id          String           @id @default(uuid())
-  title       String
-  description String           @db.Text
-  status      IncidentStatus   @default(OPEN)
-  priority    IncidentPriority @default(MEDIUM)
-  category    IncidentCategory @default(OTHER)
+// ------------------------------------------------------------------------------
+// SLAPolicy
+// One policy per priority per organization.  Attached to an incident at
+// creation time; slaBreachAt is computed once and stored on the incident.
+// ------------------------------------------------------------------------------
+model SLAPolicy {
+  id                String           @id @default(uuid())
+  organizationId    String           @map("organization_id")
+  name              String
+  priority          IncidentPriority
+  // Time (minutes) from incident creation until first response is required
+  responseMinutes   Int              @map("response_minutes")
+  // Time (minutes) from incident creation until resolution is required
+  resolutionMinutes Int              @map("resolution_minutes")
+  active            Boolean          @default(true)
+  createdAt         DateTime         @default(now()) @map("created_at")
+  updatedAt         DateTime         @updatedAt @map("updated_at")
 
-  // Parties
-  reportedById String  @map("reported_by_id")
-  assigneeId   String? @map("assignee_id")
-  teamId       String? @map("team_id")
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  incidents    Incident[]
+
+  // The SLA monitor job queries: WHERE organizationId = ? AND priority = ?
+  // to find the right policy at incident creation time.
+  @@unique([organizationId, priority])
+  @@index([organizationId, priority])
+  @@index([active])
+  @@map("sla_policies")
+}
+
+// ------------------------------------------------------------------------------
+// Incident
+// Core entity.  incidentNumber is a human-readable sequential counter that is
+// separate from the UUID primary key so that the PK is never exposed as an
+// enumerable integer to end users.
+// ------------------------------------------------------------------------------
+model Incident {
+  // UUIDs as PK — safe to embed in URLs/emails without leaking record count
+  id             String           @id @default(uuid())
+  // Human-readable reference (INC-0001).  Auto-incremented via PostgreSQL
+  // SEQUENCE.  Unique per organization — see migration for sequence definition.
+  incidentNumber Int              @map("incident_number")
+  title          String
+  description    String           @db.Text
+  status         IncidentStatus   @default(OPEN)
+  priority       IncidentPriority @default(MEDIUM)
+  category       IncidentCategory @default(OTHER)
+
+  // Org + parties
+  organizationId String  @map("organization_id")
+  reporterId     String  @map("reporter_id")
+  assigneeId     String? @map("assignee_id")
+  teamId         String? @map("team_id")
+  slaId          String? @map("sla_id")
 
   // SLA tracking
-  slaBreachAt      DateTime? @map("sla_breach_at")
+  slaBreachAt      DateTime? @map("sla_breach_at") // Computed deadline
   slaBreached      Boolean   @default(false) @map("sla_breached")
-  slaHoldStartedAt DateTime? @map("sla_hold_started_at") // Set when status → ON_HOLD
+  // Timestamp when status changed to ON_HOLD — used to compute pause duration
+  slaHoldStartedAt DateTime? @map("sla_hold_started_at")
+  // Accumulated hold time in minutes — added to slaBreachAt when resumed
+  slaHoldMinutes   Int       @default(0) @map("sla_hold_minutes")
+  // Resolution time in minutes — computed when status → RESOLVED
+  resolutionTime   Int?      @map("resolution_time")
 
   // Lifecycle timestamps
+  assignedAt DateTime? @map("assigned_at")
   resolvedAt DateTime? @map("resolved_at")
   closedAt   DateTime? @map("closed_at")
+  dueAt      DateTime? @map("due_at") // Manual due date override
   createdAt  DateTime  @default(now()) @map("created_at")
   updatedAt  DateTime  @updatedAt @map("updated_at")
 
-  // Relations
-  reportedBy  User         @relation("ReportedBy", fields: [reportedById], references: [id])
-  assignee    User?        @relation("AssignedTo", fields: [assigneeId], references: [id])
-  team        Team?        @relation(fields: [teamId], references: [id])
-  comments    Comment[]
-  attachments Attachment[]
-  auditLogs   AuditLog[]
+  // Soft-delete — incidents must not disappear from audit history
+  deletedAt DateTime? @map("deleted_at")
 
-  // Indexes based on the most common query patterns
+  // Relations
+  organization Organization         @relation(fields: [organizationId], references: [id])
+  reporter     User                 @relation("ReportedBy", fields: [reporterId], references: [id])
+  assignee     User?                @relation("AssignedTo", fields: [assigneeId], references: [id])
+  team         Team?                @relation(fields: [teamId], references: [id])
+  slaPolicy    SLAPolicy?           @relation(fields: [slaId], references: [id])
+  assignments  IncidentAssignment[]
+  comments     IncidentComment[]
+  attachments  IncidentAttachment[]
+  auditLogs    IncidentAuditLog[]
+
+  // -- Index rationale --
+  //
+  // [organizationId, incidentNumber]: primary human lookup ("INC-0042 in org X")
+  @@unique([organizationId, incidentNumber])
+  //
+  // [status]: all dashboard "open incidents" / "by-status" queries filter on this alone
   @@index([status])
+  //
+  // [priority]: "critical incidents" list, alert routing
   @@index([priority])
-  @@index([status, priority]) // Dashboard filter queries
-  @@index([assigneeId])       // Workload queries per engineer
-  @@index([teamId])           // Team dashboard queries
-  @@index([reportedById])
-  @@index([slaBreachAt])      // SLA monitor job query
-  @@index([createdAt])        // Time-series / trend queries
+  //
+  // [status, priority]: the most common dashboard composite — "all OPEN CRITICAL incidents"
+  // A composite index serves both the multi-column filter and the single-column priority scan.
+  @@index([status, priority])
+  //
+  // [organizationId, status]: every tenant-scoped list query filters on both columns;
+  // without organizationId prefix the index would scan rows from all tenants.
+  @@index([organizationId, status])
+  //
+  // [organizationId, status, priority]: tenant-scoped dashboard combo filter
+  @@index([organizationId, status, priority])
+  //
+  // [assigneeId]: "my incidents" workload page — single-column FK scan
+  @@index([assigneeId])
+  //
+  // [organizationId, assigneeId, status]: workload query scoped to non-closed
+  // incidents per engineer inside an org — avoids full table scan for large deployments
+  @@index([organizationId, assigneeId, status])
+  //
+  // [teamId]: team dashboard — all incidents owned by a team
+  @@index([teamId])
+  //
+  // [reporterId]: "incidents I reported" filter
+  @@index([reporterId])
+  //
+  // [slaBreachAt]: SLA monitor cron — WHERE slaBreachAt <= NOW() AND NOT slaBreached
+  @@index([slaBreachAt])
+  //
+  // [slaBreached, status]: SLA breach count badge on dashboard —
+  // WHERE slaBreached = true AND status NOT IN (RESOLVED, CLOSED)
+  @@index([slaBreached, status])
+  //
+  // [createdAt]: trend charts, time-range filtering, default sort
+  @@index([createdAt])
+  //
+  // [updatedAt]: "recently updated" feed on dashboard
+  @@index([updatedAt])
+  //
+  // [deletedAt]: soft-delete filter — WHERE deletedAt IS NULL is on virtually every query
+  // A partial index (only non-null deletedAt) would be ideal in raw SQL, but Prisma does
+  // not support partial index syntax; this full index still helps the IS NULL fast-path.
+  @@index([deletedAt])
   @@map("incidents")
 }
 
-model Comment {
-  id         String   @id @default(uuid())
-  incidentId String   @map("incident_id")
-  authorId   String   @map("author_id")
-  body       String   @db.Text
-  isInternal Boolean  @default(false) @map("is_internal") // Internal notes not visible to VIEWER role
+// ------------------------------------------------------------------------------
+// IncidentAssignment
+// Tracks the full history of who was assigned to an incident and when.
+// The current assignee is denormalized on Incident.assigneeId for fast lookup;
+// this table is the auditable history.
+// ------------------------------------------------------------------------------
+model IncidentAssignment {
+  id           String    @id @default(uuid())
+  incidentId   String    @map("incident_id")
+  assigneeId   String    @map("assignee_id")
+  assignedAt   DateTime  @default(now()) @map("assigned_at")
+  // NULL until the next assignment supersedes this record
+  unassignedAt DateTime? @map("unassigned_at")
+  assignedById String    @map("assigned_by_id")
+
+  incident Incident @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+  assignee User     @relation(fields: [assigneeId], references: [id])
+
+  // History timeline for an incident — most common read pattern
+  @@index([incidentId, assignedAt])
+  // Workload history per engineer over time
+  @@index([assigneeId, assignedAt])
+  @@map("incident_assignments")
+}
+
+// ------------------------------------------------------------------------------
+// IncidentComment
+// isInternal: true → only ENGINEER/MANAGER/ADMIN can see this comment.
+// VIEWER role is filtered on the repository layer.
+// ------------------------------------------------------------------------------
+model IncidentComment {
+  id         String    @id @default(uuid())
+  incidentId String    @map("incident_id")
+  authorId   String    @map("author_id")
+  body       String    @db.Text
+  isInternal Boolean   @default(false) @map("is_internal")
   editedAt   DateTime? @map("edited_at")
-  createdAt  DateTime @default(now()) @map("created_at")
+  deletedAt  DateTime? @map("deleted_at") // Soft-delete for comment history
+  createdAt  DateTime  @default(now()) @map("created_at")
 
   incident Incident @relation(fields: [incidentId], references: [id], onDelete: Cascade)
   author   User     @relation(fields: [authorId], references: [id])
 
-  @@index([incidentId])
+  // Comment thread for an incident — paginated, ordered by createdAt
+  @@index([incidentId, createdAt])
   @@index([authorId])
-  @@map("comments")
+  @@map("incident_comments")
 }
 
-model Attachment {
-  id           String   @id @default(uuid())
-  incidentId   String   @map("incident_id")
-  uploadedById String   @map("uploaded_by_id")
-  filename     String   // Original filename shown in the UI
-  storagePath  String   @map("storage_path") // Path on disk or S3 key
-  mimeType     String   @map("mime_type")
-  size         Int      // File size in bytes
-  createdAt    DateTime @default(now()) @map("created_at")
+// ------------------------------------------------------------------------------
+// IncidentAttachment
+// ------------------------------------------------------------------------------
+model IncidentAttachment {
+  id           String    @id @default(uuid())
+  incidentId   String    @map("incident_id")
+  uploadedById String    @map("uploaded_by_id")
+  filename     String // Original filename for UI display
+  storagePath  String    @map("storage_path") // Disk path or S3 object key
+  mimeType     String    @map("mime_type")
+  size         Int // Bytes
+  deletedAt    DateTime? @map("deleted_at") // Soft-delete — preserve audit entry
+  createdAt    DateTime  @default(now()) @map("created_at")
 
   incident   Incident @relation(fields: [incidentId], references: [id], onDelete: Cascade)
   uploadedBy User     @relation(fields: [uploadedById], references: [id])
 
+  // Attachment list for an incident detail page
   @@index([incidentId])
-  @@map("attachments")
+  @@map("incident_attachments")
 }
 
-model AuditLog {
+// ------------------------------------------------------------------------------
+// IncidentActivity
+// Lightweight denormalized feed of human-readable activity events surfaced in
+// the incident timeline UI.  Separate from AuditLog (which is structured
+// field-level diffs used by compliance/admin) so the two can evolve independently.
+// ------------------------------------------------------------------------------
+model IncidentActivity {
   id         String   @id @default(uuid())
-  incidentId String?  @map("incident_id") // Nullable — some audit entries are system-wide
-  actorId    String   @map("actor_id")
-  action     String   // One of the AUDIT_ACTION constants
-  fieldName  String?  @map("field_name") // The specific field that changed
-  oldValue   String?  @map("old_value")  // Stored as JSON string for complex values
-  newValue   String?  @map("new_value")
-  metadata   Json?    // Additional context (e.g., IP address, user agent)
+  incidentId String   @map("incident_id")
+  actorId    String?  @map("actor_id") // NULL for system-generated entries
+  // Human-readable event text, e.g. "Alice assigned this to Bob"
+  message    String
+  // Machine-readable type for icon rendering in the timeline
+  eventType  String   @map("event_type")
+  metadata   Json? // Optional structured data (e.g. old/new values for hover)
   createdAt  DateTime @default(now()) @map("created_at")
 
-  // Insert-only — no update or delete operations permitted
+  // Timeline for an incident — ordered by createdAt, paginated
+  @@index([incidentId, createdAt])
+  @@map("incident_activities")
+}
+
+// ------------------------------------------------------------------------------
+// IncidentAuditLog
+// Structured, immutable field-level change log for compliance and admin views.
+// Insert-only — the service/repository layer must never update or delete these.
+// ------------------------------------------------------------------------------
+model IncidentAuditLog {
+  id         String      @id @default(uuid())
+  // incidentId is nullable so system-level actions (user role changes) can also
+  // be recorded here without forcing an artificial incident linkage.
+  incidentId String?     @map("incident_id")
+  actorId    String      @map("actor_id")
+  action     AuditAction
+  // fieldName is set for INCIDENT_UPDATED to identify which field changed
+  fieldName  String?     @map("field_name")
+  // oldValue / newValue stored as JSON strings to support any value type
+  oldValue   String?     @map("old_value")
+  newValue   String?     @map("new_value")
+  // Additional context — IP address, user agent, request ID, etc.
+  metadata   Json?
+  createdAt  DateTime    @default(now()) @map("created_at")
+
   incident Incident? @relation(fields: [incidentId], references: [id], onDelete: SetNull)
   actor    User      @relation(fields: [actorId], references: [id])
 
-  @@index([incidentId]) // Audit history per incident
-  @@index([actorId])    // Audit history per user (admin view)
-  @@index([action])     // Filter by action type
-  @@index([createdAt])  // Time-range queries
-  @@map("audit_logs")
+  // Audit history per incident — admin "audit trail" tab
+  @@index([incidentId, createdAt])
+  // Audit history per user — admin "actor activity" report
+  @@index([actorId, createdAt])
+  // Filter by action type — e.g., "show only STATUS_CHANGED entries"
+  @@index([action])
+  // Time-range compliance queries — "all changes between date A and date B"
+  @@index([createdAt])
+  @@map("incident_audit_logs")
 }
 
+// ------------------------------------------------------------------------------
+// Notification
+// In-app notification delivered via WebSocket and persisted here for the
+// notification inbox.  Read status drives the unread badge count.
+// ------------------------------------------------------------------------------
 model Notification {
   id          String           @id @default(uuid())
   userId      String           @map("user_id")
   type        NotificationType
   title       String
   body        String
-  referenceId String?          @map("reference_id") // e.g., incidentId for deep-linking
+  // referenceId enables deep-linking — typically an incidentId
+  referenceId String?          @map("reference_id")
   read        Boolean          @default(false)
+  readAt      DateTime?        @map("read_at")
   createdAt   DateTime         @default(now()) @map("created_at")
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  @@index([userId, read]) // Badge count query — frequent and must be fast
+  // Unread badge count: SELECT COUNT(*) WHERE userId = ? AND read = false
+  // This composite index makes that O(log n) regardless of total notification count.
+  @@index([userId, read])
+  // Notification inbox list — paginated, newest first
   @@index([userId, createdAt])
   @@map("notifications")
+}
+
+// ------------------------------------------------------------------------------
+// NotificationPreference
+// Per-user, per-notification-type opt-in/opt-out.  Consulted before creating
+// a Notification row or sending an email.
+// ------------------------------------------------------------------------------
+model NotificationPreference {
+  id        String           @id @default(uuid())
+  userId    String           @map("user_id")
+  type      NotificationType
+  inApp     Boolean          @default(true) @map("in_app")
+  email     Boolean          @default(false) @map("email")
+  createdAt DateTime         @default(now()) @map("created_at")
+  updatedAt DateTime         @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Preference lookup: "does this user want in-app notifications for type X?"
+  // Called before every notification dispatch — must be indexed.
+  @@unique([userId, type])
+  @@index([userId])
+  @@map("notification_preferences")
 }
